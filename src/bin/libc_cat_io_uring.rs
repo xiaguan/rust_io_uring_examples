@@ -1,6 +1,9 @@
 use libc::{c_int, syscall, SYS_io_uring_enter, SYS_io_uring_setup};
 
 use bitflags::bitflags;
+use log::{debug, error, info};
+
+use std::time::Instant;
 
 bitflags! {
     #[derive(Default,Debug)]
@@ -25,7 +28,7 @@ bitflags! {
 macro_rules! check_feature {
     ($self:expr, $feature:ident) => {
         if !$self.contains(IoUringFeatures::$feature) {
-            eprintln!(concat!(
+            info!(concat!(
                 "IO_RING_FEAT_",
                 stringify!($feature),
                 " not supported"
@@ -55,7 +58,13 @@ impl IoUringFeatures {
 bitflags! {
     #[derive(Default,Debug)]
     pub struct IoUringSetupFlags: u32 {
+        // Perform busy-waiting for an I/O completion.
+        // Busy-waiting provides lower latency, but may consumes more CPU.
+        // Only support direct I/O.
+        // Only applicable for storage devices that support I/O polling.
         const IORING_SETUP_IOPOLL = 1 << 0;
+        // A kernel thread is created to perform submission queue polling.
+        // Could submit I/O requests without context switching.
         const IORING_SETUP_SQPOLL = 1 << 1;
         const IORING_SETUP_SQ_AFF = 1 << 2;
         const IORING_SETUP_CQSIZE = 1 << 3;
@@ -65,7 +74,9 @@ bitflags! {
         const IORING_SETUP_SUBMIT_ALL = 1 << 7;
         const IORING_SETUP_COOP_TASKRUN = 1 << 8;
         const IORING_SETUP_TASKRUN_FLAG = 1 << 9;
+        // IORING_OP_URING_CMD passthrough command for NVMe passthrough needs this.
         const IORING_SETUP_SQE128 = 1 << 10;
+        // Same as IORING_SETUP_SQE128, but for CQE.
         const IORING_SETUP_CQE32 = 1 << 11;
         const IORING_SETUP_SINGLE_ISSUER = 1 << 12;
         const IORING_SETUP_DEFER_TASKRUN = 1 << 13;
@@ -134,21 +145,20 @@ fn io_uring_setup(entries: u32) -> (i64, IoUringParams) {
     // Params is used by the application to pass options o the kernel.(Flags)
     // And to receive information back from the kernel.(Features)
     let mut params = IoUringParams::default();
-    // You could set flags here
+
+    // You could set flags here, for example:
     // params.flags = IoUringSetupFlags::IORING_SETUP_IOPOLL;
 
     let params_ptr = &mut params as *mut IoUringParams;
     let io_uring_fd = unsafe { syscall(SYS_io_uring_setup, entries, params_ptr) };
     assert!(io_uring_fd >= 0, "io_uring_setup failed: {}", io_uring_fd);
-    println!("io_uring_setup success ,params: {:#?}", params);
+    debug!("io_uring_setup success ,params: {:#?}", params);
 
     // Make sure setup() has set the correct values
     assert_eq!(params.sq_entries, entries);
-    assert_eq!(params.cq_entries, entries);
-
     // Check if the kernel supports the features we need
     if !params.features.contains(IoUringFeatures::SINGLE_MMAP) {
-        eprintln!("IORING_FEAT_SINGLE_MMAP not supported(kernel version >= 5.4 required)");
+        error!("IORING_FEAT_SINGLE_MMAP not supported(kernel version >= 5.4 required)");
     }
 
     // Print unsupported features for debugging
@@ -338,9 +348,20 @@ fn check_struct_repr() {
     assert_eq!(std::mem::size_of::<IoUringParams>(), 120);
 }
 
+// Define the time_it macro
+macro_rules! time_it {
+    ($message:expr, $block:block) => {{
+        let start = Instant::now();
+        let result = $block;
+        info!("{}: {:?}", $message, start.elapsed());
+        result
+    }};
+}
+
 fn main() {
+    env_logger::init();
     check_struct_repr();
-    let (ring_fd, io_uring_params) = io_uring_setup(1);
+    let (ring_fd, io_uring_params) = time_it!("io_uring_setup", { io_uring_setup(1) });
 
     assert_eq!(io_uring_params.sq_off.array, 128);
     let submit_ring_size = io_uring_params.sq_off.array
@@ -356,24 +377,24 @@ fn main() {
     };
     assert_eq!(ring_size, 132);
     // Map in the submission and completion queue ring buffers.
-    let sq_ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            ring_size as usize,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_POPULATE,
-            ring_fd as c_int,
-            // IORING_OFF_SQ_RING == 0ULL
-            // IORING_OFF_CQ_RING == 0x8000000ULL
-            0,
-        )
-    };
+    let sq_ptr = time_it!("mmap", {
+        unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                ring_size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                ring_fd as c_int,
+                0,
+            )
+        }
+    });
 
     if sq_ptr == libc::MAP_FAILED {
-        eprintln!("mmap failed: {}", std::io::Error::last_os_error());
+        error!("mmap failed: {}", std::io::Error::last_os_error());
     }
     let cq_ptr = sq_ptr;
-    println!("Mmap success: sq_ptr: {:p}, cq_ptr: {:p}", sq_ptr, cq_ptr);
+    debug!("Mmap success: sq_ptr: {:p}, cq_ptr: {:p}", sq_ptr, cq_ptr);
 
     let mut submitter = Submitter::default();
     let sring = &mut submitter.sq_ring;
@@ -391,22 +412,25 @@ fn main() {
     sring.flags = unsafe { sq_ptr.add(io_uring_params.sq_off.flags as usize) as *mut u32 };
     assert_eq!(io_uring_params.sq_off.array, 128);
     sring.array = unsafe { sq_ptr.add(io_uring_params.sq_off.array as usize) as *mut u32 };
-    println!("After setting sring: {:#?}", sring);
+    debug!("After setting sring: {:#?}", sring);
 
     // Map in the submission and completion queue ring buffers.
-    submitter.sqes = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            io_uring_params.sq_entries as usize * std::mem::size_of::<IoUringSqe>(),
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_POPULATE,
-            ring_fd as c_int,
-            // IORING_OFF_SQES == 0x10000000ULL
-            0x10000000,
-        ) as *mut IoUringSqe
-    };
+    submitter.sqes = time_it!("mmap", {
+        let raw_mem_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                io_uring_params.sq_entries as usize * std::mem::size_of::<IoUringSqe>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                ring_fd as c_int,
+                // IORING_OFF_SQES == 0x10000000ULL
+                0x10000000,
+            )
+        };
+        raw_mem_ptr as *mut IoUringSqe
+    });
     if submitter.sqes == libc::MAP_FAILED as *mut IoUringSqe {
-        eprintln!("mmap failed: {}", std::io::Error::last_os_error());
+        error!("mmap failed: {}", std::io::Error::last_os_error());
     }
 
     let cring = &mut submitter.cq_ring;
@@ -416,9 +440,16 @@ fn main() {
     cring.ring_entries =
         unsafe { cq_ptr.add(io_uring_params.cq_off.ring_entries as usize) as *mut u32 };
     cring.cqes = unsafe { cq_ptr.add(io_uring_params.cq_off.cqes as usize) as *mut IoUringCQE };
-    println!("After setting cring: {:#?}", cring);
+    debug!("After setting cring: {:#?}", cring);
 
-    let file_fd = unsafe { libc::open("Cargo.toml\0".as_ptr() as *const i8, libc::O_RDONLY) };
+    let file_fd = time_it!("open", {
+        unsafe {
+            libc::open(
+                std::ffi::CString::new("Cargo.toml").unwrap().as_ptr(),
+                libc::O_RDONLY,
+            )
+        }
+    });
     if file_fd < 0 {
         eprintln!("open failed: {}", std::io::Error::last_os_error());
     }
@@ -449,16 +480,18 @@ fn main() {
     // Update the tail after writing the SQE
     unsafe { *sring.tail = tail + 1 };
 
-    let ret = unsafe { syscall(SYS_io_uring_enter, ring_fd, 1, 1, 0, 0, 0) };
+    let ret = time_it!("io_uring_enter", {
+        unsafe { syscall(SYS_io_uring_enter, ring_fd, 1, 1, 0, 0, 0) }
+    });
     assert_eq!(ret, 1);
 
     let head = cring.head;
 
     let cqe = unsafe { &*cring.cqes.offset(*head as isize) };
     if cqe.res < 0 {
-        eprintln!("cqe.res < 0: {}", cqe.res);
+        error!("cqe.res < 0: {}", cqe.res);
     }
     // Print the buffer
     let content: String = buffer.iter().map(|&c| c as char).collect();
-    println!("Content: {}", content);
+    println!("{}", content);
 }
