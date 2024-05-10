@@ -22,9 +22,62 @@ bitflags! {
     }
 }
 
+macro_rules! check_feature {
+    ($self:expr, $feature:ident) => {
+        if !$self.contains(IoUringFeatures::$feature) {
+            eprintln!(concat!(
+                "IO_RING_FEAT_",
+                stringify!($feature),
+                " not supported"
+            ));
+        }
+    };
+}
+impl IoUringFeatures {
+    pub fn output_unsupported_features(&self) {
+        check_feature!(self, SINGLE_MMAP);
+        check_feature!(self, NODROP);
+        check_feature!(self, SUBMIT_STABLE);
+        check_feature!(self, RW_CUR_POS);
+        check_feature!(self, CUR_PERSONALITY);
+        check_feature!(self, FAST_POLL);
+        check_feature!(self, POLL_32BITS);
+        check_feature!(self, SQPOLL_NONFIXED);
+        check_feature!(self, EXT_ARG);
+        check_feature!(self, NATIVE_WORKERS);
+        check_feature!(self, RSRC_TAGS);
+        check_feature!(self, CQE_SKIP);
+        check_feature!(self, LINKED_FILE);
+        check_feature!(self, REG_REG_RING);
+    }
+}
+
+bitflags! {
+    #[derive(Default,Debug)]
+    pub struct IoUringSetupFlags: u32 {
+        const IORING_SETUP_IOPOLL = 1 << 0;
+        const IORING_SETUP_SQPOLL = 1 << 1;
+        const IORING_SETUP_SQ_AFF = 1 << 2;
+        const IORING_SETUP_CQSIZE = 1 << 3;
+        const IORING_SETUP_CLAMP = 1 << 4;
+        const IORING_SETUP_ATTACH_WQ = 1 << 5;
+        const IORING_SETUP_R_DISABLED = 1 << 6;
+        const IORING_SETUP_SUBMIT_ALL = 1 << 7;
+        const IORING_SETUP_COOP_TASKRUN = 1 << 8;
+        const IORING_SETUP_TASKRUN_FLAG = 1 << 9;
+        const IORING_SETUP_SQE128 = 1 << 10;
+        const IORING_SETUP_CQE32 = 1 << 11;
+        const IORING_SETUP_SINGLE_ISSUER = 1 << 12;
+        const IORING_SETUP_DEFER_TASKRUN = 1 << 13;
+        const IORING_SETUP_NO_MMAP = 1 << 14;
+        const IORING_SETUP_REGISTERED_FD_ONLY = 1 << 15;
+        const IORING_SETUP_NO_SQARRAY = 1 << 16;
+    }
+}
+
 #[repr(C)]
 #[derive(Default, Debug)]
-struct io_sqring_offsets {
+struct IoSQRingOffsets {
     head: u32,
     tail: u32,
     ring_mask: u32,
@@ -38,7 +91,7 @@ struct io_sqring_offsets {
 
 #[repr(C)]
 #[derive(Default, Debug)]
-struct io_cqring_offsets {
+struct IoCQRingOffsets {
     head: u32,
     tail: u32,
     ring_mask: u32,
@@ -52,25 +105,55 @@ struct io_cqring_offsets {
 
 #[repr(C)]
 #[derive(Default, Debug)]
-struct io_uring_params {
+struct IoUringParams {
     sq_entries: u32,
     cq_entries: u32,
-    flags: u32,
+    flags: IoUringSetupFlags,
     sq_thread_cpu: u32,
-    sq_thread_idel: u32,
+    sq_thread_idle: u32,
     features: IoUringFeatures,
     wq_fd: u32,
     resv: [u32; 3],
-    sq_off: io_sqring_offsets,
-    cq_off: io_cqring_offsets,
+    sq_off: IoSQRingOffsets,
+    cq_off: IoCQRingOffsets,
 }
 
 /// Setup io_uring instance.
 ///
-/// # Returns
-/// Returns the file descriptor of the io_uring instance on success, or a negative error number on failure.
-fn io_uring_setup(entries: u32, p: *mut io_uring_params) -> i64 {
-    unsafe { syscall(SYS_io_uring_setup, entries, p) }
+/// # Returns:
+/// The file descriptor of the io_uring instance on success, or a negative error number on failure.
+fn io_uring_setup(entries: u32) -> (i64, IoUringParams) {
+    // You could run the following command to get the syscall's documentation
+    // man io_uring_setup
+    //
+    // Sets up a submission queue (SQ) and a completion queue (CQ)
+    // With at least 'entries' entries in each.
+    // Returns a file descriptor which can be used to perform subsequent operations
+    // on the io_uring instance.
+    //
+    // Params is used by the application to pass options o the kernel.(Flags)
+    // And to receive information back from the kernel.(Features)
+    let mut params = IoUringParams::default();
+    // You could set flags here
+    // params.flags = IoUringSetupFlags::IORING_SETUP_IOPOLL;
+
+    let params_ptr = &mut params as *mut IoUringParams;
+    let io_uring_fd = unsafe { syscall(SYS_io_uring_setup, entries, params_ptr) };
+    assert!(io_uring_fd >= 0, "io_uring_setup failed: {}", io_uring_fd);
+    println!("io_uring_setup success ,params: {:#?}", params);
+
+    // Make sure setup() has set the correct values
+    assert_eq!(params.sq_entries, entries);
+    assert_eq!(params.cq_entries, entries);
+
+    // Check if the kernel supports the features we need
+    if !params.features.contains(IoUringFeatures::SINGLE_MMAP) {
+        eprintln!("IORING_FEAT_SINGLE_MMAP not supported(kernel version >= 5.4 required)");
+    }
+
+    // Print unsupported features for debugging
+    params.features.output_unsupported_features();
+    return (io_uring_fd, params);
 }
 
 #[repr(C)]
@@ -244,7 +327,7 @@ struct IoVec {
     len: usize,
 }
 
-fn main() {
+fn check_struct_repr() {
     assert_eq!(std::mem::size_of::<IoUringCQE>(), 16);
     assert_eq!(std::mem::size_of::<OffAddr2>(), 8);
     assert_eq!(std::mem::size_of::<AddrSpliceOffIn>(), 8);
@@ -252,25 +335,19 @@ fn main() {
     assert_eq!(std::mem::size_of::<SpliceFdInFileIndexOptlen>(), 4);
     assert_eq!(std::mem::size_of::<Addr3OptvalCmd>(), 8);
     assert_eq!(std::mem::size_of::<IoUringSqe>(), 64);
-    let mut p = io_uring_params::default();
-    assert_eq!(std::mem::size_of::<io_uring_params>(), 120);
-    let ring_fd = io_uring_setup(1, &mut p);
-    if ring_fd < 0 {
-        eprintln!("io_uring_setup failed: {}", ring_fd);
-    }
+    assert_eq!(std::mem::size_of::<IoUringParams>(), 120);
+}
 
-    println!("After io_uring_setup: {:#?}", p);
-    // Check io_uring features support IORING_FEAT_SINGLE_MMAP
-    if !p.features.contains(IoUringFeatures::SINGLE_MMAP) {
-        eprintln!("IORING_FEAT_SINGLE_MMAP not supported(kernel version >= 5.4 required)");
-    }
-    // TODO: not use the size_of a u32, but the size of the type
-    assert_eq!(p.sq_off.array, 128);
-    assert_eq!(p.sq_entries, 1);
-    let submit_ring_size = p.sq_off.array + p.sq_entries * std::mem::size_of::<c_int>() as u32;
+fn main() {
+    check_struct_repr();
+    let (ring_fd, io_uring_params) = io_uring_setup(1);
+
+    assert_eq!(io_uring_params.sq_off.array, 128);
+    let submit_ring_size = io_uring_params.sq_off.array
+        + io_uring_params.sq_entries * std::mem::size_of::<c_int>() as u32;
     assert_eq!(submit_ring_size, 132);
-    let completion_ring_size =
-        p.cq_off.cqes + p.cq_entries * std::mem::size_of::<IoUringCQE>() as u32;
+    let completion_ring_size = io_uring_params.cq_off.cqes
+        + io_uring_params.cq_entries * std::mem::size_of::<IoUringCQE>() as u32;
     assert_eq!(completion_ring_size, 96);
     let ring_size = if submit_ring_size > completion_ring_size {
         submit_ring_size
@@ -301,25 +378,26 @@ fn main() {
     let mut submitter = Submitter::default();
     let sring = &mut submitter.sq_ring;
 
-    assert_eq!(p.sq_off.head, 0);
-    sring.head = unsafe { sq_ptr.add(p.sq_off.head as usize) as *mut u32 };
-    assert_eq!(p.sq_off.tail, 4);
-    sring.tail = unsafe { sq_ptr.add(p.sq_off.tail as usize) as *mut u32 };
-    assert_eq!(p.sq_off.ring_mask, 16);
-    sring.ring_mask = unsafe { sq_ptr.add(p.sq_off.ring_mask as usize) as *mut u32 };
-    assert_eq!(p.sq_off.ring_entries, 24);
-    sring.ring_entries = unsafe { sq_ptr.add(p.sq_off.ring_entries as usize) as *mut u32 };
-    assert_eq!(p.sq_off.flags, 36);
-    sring.flags = unsafe { sq_ptr.add(p.sq_off.flags as usize) as *mut u32 };
-    assert_eq!(p.sq_off.array, 128);
-    sring.array = unsafe { sq_ptr.add(p.sq_off.array as usize) as *mut u32 };
+    assert_eq!(io_uring_params.sq_off.head, 0);
+    sring.head = unsafe { sq_ptr.add(io_uring_params.sq_off.head as usize) as *mut u32 };
+    assert_eq!(io_uring_params.sq_off.tail, 4);
+    sring.tail = unsafe { sq_ptr.add(io_uring_params.sq_off.tail as usize) as *mut u32 };
+    assert_eq!(io_uring_params.sq_off.ring_mask, 16);
+    sring.ring_mask = unsafe { sq_ptr.add(io_uring_params.sq_off.ring_mask as usize) as *mut u32 };
+    assert_eq!(io_uring_params.sq_off.ring_entries, 24);
+    sring.ring_entries =
+        unsafe { sq_ptr.add(io_uring_params.sq_off.ring_entries as usize) as *mut u32 };
+    assert_eq!(io_uring_params.sq_off.flags, 36);
+    sring.flags = unsafe { sq_ptr.add(io_uring_params.sq_off.flags as usize) as *mut u32 };
+    assert_eq!(io_uring_params.sq_off.array, 128);
+    sring.array = unsafe { sq_ptr.add(io_uring_params.sq_off.array as usize) as *mut u32 };
     println!("After setting sring: {:#?}", sring);
 
     // Map in the submission and completion queue ring buffers.
     submitter.sqes = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            p.sq_entries as usize * std::mem::size_of::<IoUringSqe>(),
+            io_uring_params.sq_entries as usize * std::mem::size_of::<IoUringSqe>(),
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED | libc::MAP_POPULATE,
             ring_fd as c_int,
@@ -332,11 +410,12 @@ fn main() {
     }
 
     let cring = &mut submitter.cq_ring;
-    cring.head = unsafe { cq_ptr.add(p.cq_off.head as usize) as *mut u32 };
-    cring.tail = unsafe { cq_ptr.add(p.cq_off.tail as usize) as *mut u32 };
-    cring.ring_mask = unsafe { cq_ptr.add(p.cq_off.ring_mask as usize) as *mut u32 };
-    cring.ring_entries = unsafe { cq_ptr.add(p.cq_off.ring_entries as usize) as *mut u32 };
-    cring.cqes = unsafe { cq_ptr.add(p.cq_off.cqes as usize) as *mut IoUringCQE };
+    cring.head = unsafe { cq_ptr.add(io_uring_params.cq_off.head as usize) as *mut u32 };
+    cring.tail = unsafe { cq_ptr.add(io_uring_params.cq_off.tail as usize) as *mut u32 };
+    cring.ring_mask = unsafe { cq_ptr.add(io_uring_params.cq_off.ring_mask as usize) as *mut u32 };
+    cring.ring_entries =
+        unsafe { cq_ptr.add(io_uring_params.cq_off.ring_entries as usize) as *mut u32 };
+    cring.cqes = unsafe { cq_ptr.add(io_uring_params.cq_off.cqes as usize) as *mut IoUringCQE };
     println!("After setting cring: {:#?}", cring);
 
     let file_fd = unsafe { libc::open("Cargo.toml\0".as_ptr() as *const i8, libc::O_RDONLY) };
